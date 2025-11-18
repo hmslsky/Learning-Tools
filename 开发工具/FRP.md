@@ -482,6 +482,316 @@ docker compose up -d
 
 ---
 
+## 4.6 Ollama本地LLM服务穿透实战
+
+下面给你一份**面向实战、可直接复制运行**的详尽指南：如何在客户端用 **frpc** 把本地运行的 **Ollama（本地 LLM 服务，默认监听 `127.0.0.1:11434`）** 安全地穿透到公网。
+
+> 先说明关键事实（已验证）：
+>
+> * Ollama 默认在 `127.0.0.1:11434` 提供 HTTP REST API（`http://localhost:11434/api/...`）。我们只需把该端口曝光到 frps 所在的公网服务器即可。
+
+### 4.6.1 步骤总览（高层）
+
+1. 在公网服务器上运行并配置好 `frps`（frps 必须可被公网访问；`vhost_http_port`/`vhost_https_port` 配置见第 4 节）。
+2. 在本地（Ollama 运行机）安装 `frpc` 并写好 `frpc` 配置文件。
+3. 根据需求选择穿透方式（TCP 直接端口 / HTTP 虚拟主机 / HTTPS + BasicAuth / STCP 点对点），启动 `frpc`。
+4. 在公网或域名上访问（或用 curl / 客户端应用调用），验证通过。
+
+### 4.6.2 先决条件检查（在本地机器上）
+
+```bash
+# 确认 Ollama 服务在本地可访问（在 Ollama 机器上运行）
+curl -sS http://127.0.0.1:11434/api  # 或访问你常用的 API 路径
+# 如果返回 404/200/类似 JSON，那么 Ollama 本地可用
+```
+
+如果 Ollama 不是绑定 `127.0.0.1`，你可以用环境变量修改（见 Ollama 文档），但建议 **让 Ollama 继续只监听本地**，由 frpc 从 localhost 读取并转发（更安全）。
+
+### 4.6.3 可选的穿透方案 —— 优缺点速览
+
+1. **TCP 端口映射（最简单）**
+
+   * 原理：把本地 `127.0.0.1:11434` 映射到 frps 的某个 `remote_port`（例如 `60034`）。
+   * 优点：配置最简单、对 Ollama 无需改动（透明传输 HTTP）。
+   * 缺点：无法使用域名复用端口（每个 TCP 服务需独占端口）；没有 HTTP 层特殊功能（BasicAuth、路径路由等）。
+
+2. **HTTP 虚拟主机（vhost，推荐用于 Web/API）**
+
+   * 原理：frps 在 `vhost_http_port`（例如 80/7080）监听 HTTP，根据请求 Host 自动转发到对应的 frpc 映射。
+   * 优点：可用域名路由（`ollama.example.com`），允许 HTTP BasicAuth、路径限制、X-Forwarded-For 等；可复用同一端口托管多个服务。
+   * 缺点：需域名解析到 frps 的公网 IP，并在 frps 侧配置 vhost 端口。
+
+3. **HTTPS（vhost + TLS） + BasicAuth（推荐生产/公网暴露）**
+
+   * 在 HTTP 方案上再加 TLS（在 frps 上配证书或用 reverse-proxy），同时启用 frp 的 HTTP BasicAuth（在 frpc 配置里设置用户名/密码）。这样即便域名被猜到也需要认证。
+
+4. **STCP / XTCP（点对点/私有链接）**
+
+   * 用于更严格的点对点场景或穿透复杂 NAT。配置更加复杂，适合需要更高安全性或点对点低延迟的场景。
+
+### 4.6.4 `frpc` 配置详解（示例 + 字段说明）
+
+> 下面我给出 **三套** 常见、可直接运行的 `frpc` 配置文件（你可以选其中之一，或同时保留多个代理条目）：
+>
+> * A. **TCP 映射（快速）**
+> * B. **HTTP 虚拟主机 + BasicAuth（推荐用于 Ollama API）**
+> * C. **HTTPS（通过 frps 的 vhost_https_port）示例 + Proxy Protocol 获取真实 IP**
+
+> 先给出 **INI** 格式（很多人使用），再给出等价的 **TOML** 片段（frp 新版官方文档示例往往用 TOML）。
+
+#### 4.6.4.1 共有 `frpc` `[common]`（必填）
+
+将下面放到 `frpc.ini` 顶部（或 `frpc.toml` 对应字段）：
+
+```ini
+[common]
+server_addr = 203.0.113.10        # 替换为你的 frps 公网 IP 或域名
+server_port = 7000                # frps 的 bind_port
+token = your-frp-token            # 如果 frps 配置了 token，请填一致
+# 可选：如果你的 frps 要求 TLS/加密层，这里设置 transport.useEncryption（TOML）
+# http_proxy = http://proxy:8080   # 如果 frpc 需通过 HTTP 代理访问 frps（可选）
+```
+
+#### A — 快速方案：**TCP 端口映射**（最简单）
+
+适合：只想快速把本地 `11434` 暴露为公网端口（比如 `60034`）。
+
+```ini
+# frpc.ini
+[common]
+server_addr = 203.0.113.10
+server_port = 7000
+token = your-frp-token
+
+[ollama-tcp]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 11434
+remote_port = 60034
+# 可选安全：启用传输加密/压缩（某些 frp 版本使用 transport.* 配置，见 TOML 例子）
+# use_encryption = true
+# use_compression = true
+```
+
+**访问方法（外部）**：
+
+```bash
+# 直接对 frps IP 的 remote_port 发起 HTTP 请求（或让应用指向该 IP:port）
+curl http://203.0.113.10:60034/api/models
+```
+
+**注意**：若要用域名并复用 80/443，请使用下方的 HTTP vhost 方案。
+
+#### B — 推荐：**HTTP 虚拟主机（vhost） + BasicAuth**（更安全，支持域名）
+
+前提（frps 上）：
+
+* `frps.ini` 中设置了 `vhost_http_port = 80`（或其他端口）并将域名 `ollama.example.com` 的 DNS 指向 frps IP。
+
+`frpc.ini`（INI 格式）：
+
+```ini
+[common]
+server_addr = frps.example.com           # 或直接用 IP
+server_port = 7000
+token = your-frp-token
+
+[ollama-http]
+type = http
+local_ip = 127.0.0.1
+local_port = 11434
+# 使用域名路由（需要你的域名解析到 frps 的 IP）
+custom_domains = ollama.example.com
+# 保护接口（HTTP Basic Auth），在访问时浏览器/客户端需要用户名密码
+http_user = ollamauser
+http_pwd = strongpassword123
+# 可选：启用 proxy protocol 版本（若需要让本地服务看到真实客户端 IP）
+# proxy_protocol_version = v2
+```
+
+**访问方法（外部）**：
+
+```
+# 通过域名访问（浏览器或应用）
+http://ollama.example.com/api/models
+# 若启用了 BasicAuth，浏览器会弹窗或 curl 需要加 -u ollamauser:strongpassword123
+curl -u ollamauser:strongpassword123 http://ollama.example.com/api/models
+```
+
+**优点**：
+
+* 可复用端口（vhost），适合多个服务共享同一公网端口；
+* 支持 BasicAuth，客户端访问更安全；
+* frps 可以额外在 vhost 层做 TLS（见 C）。
+
+#### C — 生产级：**HTTPS（vhost_https_port）+ BasicAuth + 强加密**
+
+在 `frps` 服务器上：
+
+* 配置 `vhost_https_port = 443`（或者 7443），并在 `frps` 或前端 Nginx 上配置有效 TLS 证书（Let's Encrypt / 手动证书）。
+* 如果 `frps` 本身没有内置证书或你想用 Nginx 反代：把域名 DNS 指向该服务器，用 Nginx 做反向代理到 frps 的 vhost_http_port 或 vhost_https_port。
+
+`frpc.ini`（INI）基本同上（HTTP 部分相同），客户端无需额外修改。但**强烈建议**在 `frpc`/`frps` 之间启用传输加密（transport.useEncryption）来保护隧道内数据（frp 支持在 transport 层加密）。
+
+#### 4.6.4.2 TOML（新式）配置示例（推荐用于新版 frp）
+
+如果你用 `frpc.toml`，配置更结构化且可以设置 transport 子项：
+
+```toml
+[common]
+serverAddr = "203.0.113.10"
+serverPort = 7000
+token = "your-frp-token"
+
+[[proxies]]
+name = "ollama-http"
+type = "http"
+localAddr = "127.0.0.1"
+localPort = 11434
+customDomains = ["ollama.example.com"]
+httpUser = "ollamauser"
+httpPassword = "strongpassword123"
+# 真实客户端 IP 支持（可选）
+proxyProtocolVersion = "v2"
+
+# 传输层加密与压缩（提高安全，但占用 CPU）
+[transport]
+useEncryption = true
+useCompression = true
+```
+
+**说明**：
+
+* `customDomains` 用于 vhost（域名）路由；若使用 `subdomain` 模式，请在 frps.ini 配置 `subDomainHost` 并在这里设置 `subdomain = "ollama"`。
+* `httpUser/httpPassword`（TOML）或 `http_user/http_pwd`（INI）用于 HTTP BasicAuth。
+
+### 4.6.5 安全硬化建议（必须考虑）
+
+1. **永远不要把 Ollama 直接暴露为无认证的公网 HTTP**。至少使用 BasicAuth + HTTPS。
+2. **在 frps 上启用 TLS**（`vhost_https_port` + 有效证书），或者把 frps 放在 Nginx 后面由 Nginx 终止 TLS。
+3. **frpc 与 frps 之间启用传输加密**（`transport.useEncryption = true` / `use_encryption=true`），以防中间人。
+4. **使用 strong token 或 OIDC**（frp 支持 token 与 OIDC 两种认证方式）保证客户端/服务端身份验证。
+5. **限制 Dashboard 的访问**（仅内网管理 IP 或放在 VPN 里）。
+6. **审计日志与速率限制**：监控 `frps` 日志，必要时在 nginx 层做速率限制 / IP 黑名单。
+7. **不要在不受信任的网络上保存明文凭证**（把 `frpc.ini` 权限设为 600）。
+
+### 4.6.6 启动与测试（典型命令）
+
+在 Ollama 机器上先启动 Ollama：
+
+```bash
+ollama serve   # 默认 127.0.0.1:11434
+```
+
+然后启动 frpc（假设 frpc.ini 在当前目录）：
+
+```bash
+# 前台查看日志
+frpc -c ./frpc.ini
+
+# 或后台启动（Linux / macOS）
+nohup frpc -c ~/frp/frpc.ini > frpc.log 2>&1 &
+```
+
+测试（根据方案）：
+
+* TCP 方案：
+
+```bash
+curl http://203.0.113.10:60034/api   # public_ip:remote_port
+```
+
+* HTTP vhost（带 BasicAuth）：
+
+```bash
+curl -u ollamauser:strongpassword123 http://ollama.example.com/api/models
+```
+
+* HTTPS（若已配置 TLS）：
+
+```bash
+curl -k https://ollama.example.com/api/models    # -k 若是自签名，生产应有有效证书
+```
+
+### 4.6.7 常见故障与排查步骤
+
+1. **`frpc` 无法连上 `frps`**
+
+   * 检查 `server_addr` / `server_port` 是否正确；测试 `telnet frps 7000` 或 `nc -vz frps 7000`。
+   * 检查防火墙 / 云安全组是否放行端口（尤其是 7000、vhost_http_port、vhost_https_port）。
+
+2. **访问时出现 502 / 504 或 连接被重置**
+
+   * 查看 `frpc` 日志（`frpc.log`）和 `frps` 日志，寻找 `proxy start failed`、`handshake timeout` 等信息。
+   * 确认 Ollama 本地是否仍在监听 `127.0.0.1:11434` 并能响应（`curl http://127.0.0.1:11434/api`）。
+
+3. **HTTP 请求返回 401（认证失败）**
+
+   * 确认你是否为 HTTP 类型代理启用了 `http_user` / `http_pwd`（或 TOML 中 `httpUser/httpPassword`），curl 时是否使用了 `-u user:pwd`。
+
+4. **域名访问没有正确路由到 Ollama**
+
+   * 确认域名 DNS A 记录指向 `frps` 的公网 IP。
+   * 确认 frps 的 `vhost_http_port` 被正确配置且未被防火墙阻挡。
+
+5. **要在请求中获取真实客户端 IP**
+
+   * 启用 `proxy_protocol_version = v2`（frpc 端）并在本地 Web/NGINX 上启用 proxy protocol 支持，或使用 `X-Forwarded-For` 头。（frp 文档说明）
+
+### 4.6.8 推荐的 `frpc` 模板（拷贝即可）
+
+#### INI（HTTP vhost + BasicAuth，推荐）
+
+```ini
+[common]
+server_addr = frps.example.com
+server_port = 7000
+token = ReplaceWithYourToken
+
+# Ollama via HTTP vhost with BasicAuth
+[ollama-http]
+type = http
+local_ip = 127.0.0.1
+local_port = 11434
+custom_domains = ollama.example.com
+http_user = ollamauser
+http_pwd = superStrongPassword!
+# proxy_protocol_version = v2   # 可选：如果你要把真实 IP 传给后端
+# use_encryption = true         # 某些旧版 INI 支持；新版建议用 TOML transport.useEncryption
+# use_compression = true
+```
+
+#### TOML（带 transport 加密）
+
+```toml
+[common]
+serverAddr = "frps.example.com"
+serverPort = 7000
+token = "ReplaceWithYourToken"
+
+[[proxies]]
+name = "ollama-http"
+type = "http"
+localAddr = "127.0.0.1"
+localPort = 11434
+customDomains = ["ollama.example.com"]
+httpUser = "ollamauser"
+httpPassword = "superStrongPassword!"
+
+[transport]
+useEncryption = true
+useCompression = true
+```
+
+### 4.6.9 进阶建议（如果你需要更专业部署）
+
+* 把 `frps` 和 TLS（Let's Encrypt）与 Nginx 反代结合：Nginx 做 TLS 终止 + WAF/限流，frps 做隧道转发。
+* 对于团队共享：用 `subdomain` + wildcard DNS 管理多个客户，或为每个用户分配不同 `token` / OIDC。
+* 若追求低延迟与 P2P：研究 STCP / XTCP 模式（需要额外的 `sk`/secret 配置，适合内网点对点连接）。
+* 结合 CI/CD：把 `frpc` 配置放在加密的配置仓库，用 Ansible / Salt / Puppet 部署并托管 `frpc` 服务（systemd / LaunchAgent）。
+
+---
+
 # 📘 五、总结与资源
 
 ## 5.1 总结与未来
@@ -517,4 +827,5 @@ FRP 是一款 **轻量级、高性能、完全可自托管** 的内网穿透解�
 * 国内镜像下载：[https://mirror.ghproxy.com/github.com/fatedier/frp/releases](https://mirror.ghproxy.com/github.com/fatedier/frp/releases)
 * 社区管理面板：
   🔗 `https://github.com/Zo3i/frp-admin`
+
 
